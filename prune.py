@@ -332,6 +332,34 @@ def control_torrent(torrent_id, operation):
     })
 
 
+def list_torbox_queue():
+    """
+    Fetch TorBox's own internal download queue via /v1/api/queued/getqueued.
+    These are items waiting for a free slot — separate from the active mylist.
+    Returns list of dicts with keys: id, hash, name, magnet, created_at, type.
+    """
+    try:
+        r = api_get("/v1/api/queued/getqueued")
+        if r.get("success"):
+            return r.get("data") or []
+        log(f"  ⚠ getqueued returned success=False: {r.get('detail','')}", "warn")
+    except Exception as e:
+        log(f"  ⚠ getqueued failed: {e}", "warn")
+    return []
+
+
+def control_queued_torrent(queued_id, operation):
+    """
+    Control a TorBox queued item.
+    Valid operations: 'start' (promote to active slot), 'delete'.
+    queued_id is the id from /v1/api/queued/getqueued, NOT the torrent_id.
+    """
+    return api_post("/v1/api/queued/controlqueued", {
+        "queued_id": queued_id,
+        "operation": operation,
+    })
+
+
 def add_torrent(magnet_or_url, as_queued=False):
     """
     Add a torrent to TorBox via /v1/api/torrents/createtorrent.
@@ -804,14 +832,21 @@ def _extract_hash(magnet):
     return m.group(1).lower() if m else None
 
 
-def add_from_queue(slots_free, state, cfg, live_torrents=None):
+def fill_slots(slots_free, state, cfg, live_torrents=None):
     """
-    Fill free slots from queue.jsonl.
+    Fill free slots using two sources in priority order:
 
-    Changes vs old version:
-    - max_adds = slots_free (no more hard cap of 3 — fill ALL open slots)
-    - Dedup: skip items whose infohash already exists in TorBox (any state)
-    - Cleanup: remove successfully added items from queue.jsonl immediately
+    1. TorBox's own internal queue (GET /v1/api/queued/getqueued)
+       Items here are waiting for a slot. We promote them via
+       POST /v1/api/queued/controlqueued {operation: "start"}.
+       These are the user's real backlog — always consumed first.
+
+    2. Local queue.jsonl (magnet links added manually via add-to-queue.sh)
+       Only used to top up any slots still free after the TorBox queue
+       is exhausted or empty. Added via createtorrent as new items.
+       Deduped by infohash against live TorBox inventory (active + queued).
+
+    Both sources respect the daily cap (queue_daily_add_cap).
     """
     if not cfg.get("queue_enabled", True) or slots_free <= 0:
         return [], []
@@ -822,90 +857,111 @@ def add_from_queue(slots_free, state, cfg, live_torrents=None):
         state["queue_consumed_today"] = 0
     daily_cap = cfg.get("queue_daily_add_cap", 50)
     if state.get("queue_consumed_today", 0) >= daily_cap:
-        log(f"  ⏭  daily queue cap ({daily_cap}) reached")
+        log(f"  ⏭  daily cap ({daily_cap}) reached")
         return [], []
 
-    queue = load_queue()
-    if not queue:
-        log(f"  📭 queue is empty ({QUEUE_PATH}), nothing to add")
-        return [], []
+    added = []
+    remaining_slots = slots_free
 
-    # Build set of hashes already in TorBox (any download_state) for dedup
-    live_hashes = set()
-    if live_torrents:
-        for t in live_torrents:
+    # ── Source 1: TorBox internal queue ──────────────────────────────────────
+    torbox_queue = list_torbox_queue()
+    if torbox_queue:
+        log(f"  📋 TorBox queue: {len(torbox_queue)} item(s) waiting for a slot")
+        for item in torbox_queue:
+            if remaining_slots <= 0 or state["queue_consumed_today"] >= daily_cap:
+                break
+            qid  = item.get("id")
+            name = item.get("name") or item.get("hash", "?")[:16]
+            try:
+                r = control_queued_torrent(qid, "start")
+                if r.get("success"):
+                    state["queue_consumed_today"] += 1
+                    remaining_slots -= 1
+                    added.append({"source": "torbox_queue", "queued_id": qid, "name": name})
+                    log(f"  ✓ started queued id={qid} '{name[:60]}' "
+                        f"({state['queue_consumed_today']}/{daily_cap} today)")
+                else:
+                    log(f"  ✗ start queued id={qid} failed: {r.get('detail','')[:80]}")
+            except (HTTPError, URLError) as e:
+                log(f"  ✗ start queued id={qid} error: {e}")
+    else:
+        log(f"  📭 TorBox queue is empty")
+
+    # ── Source 2: local queue.jsonl top-up ────────────────────────────────────
+    local_queue = load_queue()
+    if local_queue and remaining_slots > 0:
+        log(f"  📂 local queue.jsonl: {len(local_queue)} item(s), "
+            f"{remaining_slots} slot(s) still free")
+
+        # Build live hash set for dedup (active + TorBox queued)
+        live_hashes = set()
+        for t in (live_torrents or []):
             h = (t.get("hash") or "").lower()
             if h:
                 live_hashes.add(h)
             for alt in (t.get("alternative_hashes") or []):
                 live_hashes.add(alt.lower())
+        for t in torbox_queue:
+            h = (t.get("hash") or "").lower()
+            if h:
+                live_hashes.add(h)
 
-    # Fill all free slots, bounded only by daily cap — no per-run add cap
-    max_adds = slots_free
-    added, failed, remaining_queue = [], [], []
+        remaining_local = []
+        for item in local_queue:
+            if remaining_slots <= 0 or state["queue_consumed_today"] >= daily_cap:
+                remaining_local.append(item)
+                continue
 
-    for item in queue:
-        magnet = item.get("magnet") or item.get("url") or item.get("link")
+            magnet = item.get("magnet") or item.get("url") or item.get("link")
+            if not magnet or not isinstance(magnet, str):
+                log(f"  ⚠ dropping invalid local queue item: {str(item)[:80]}")
+                continue
+            if not (magnet.startswith("magnet:?") or magnet.startswith("http")):
+                log(f"  ⚠ dropping local queue item with unrecognised scheme: {str(item)[:80]}")
+                continue
 
-        # Items we won't add: invalid or cap reached — keep in queue
-        if len(added) >= max_adds or state["queue_consumed_today"] >= daily_cap:
-            remaining_queue.append(item)
-            continue
+            item_hash = _extract_hash(magnet)
+            if item_hash and item_hash in live_hashes:
+                log(f"  ⏭  skipping local item (already in TorBox): "
+                    f"{item.get('name', item_hash[:12])}")
+                continue  # remove from local queue — already present
 
-        if not magnet or not isinstance(magnet, str):
-            log(f"  ⚠ dropping invalid queue item (no magnet): {str(item)[:80]}")
-            # Drop malformed items from queue permanently
-            continue
+            try:
+                r = add_torrent(magnet)
+                if r.get("success"):
+                    data = r.get("data")
+                    tid = data.get("torrent_id") if isinstance(data, dict) else None
+                    if tid is None and isinstance(data, int):
+                        tid = data
+                    if tid is None:
+                        log(f"  ⚠ add succeeded but no torrent_id: {r}")
+                        remaining_local.append(item)
+                        continue
+                    state.setdefault("fresh_ids", {})[str(tid)] = (
+                        datetime.now(timezone.utc).isoformat()
+                    )
+                    state["queue_consumed_today"] += 1
+                    remaining_slots -= 1
+                    added.append({"source": "local_queue", "torrent_id": tid,
+                                  "name": item.get("name", magnet[:40])})
+                    log(f"  ✓ added local id={tid} '{item.get('name', magnet[:40])}' "
+                        f"({state['queue_consumed_today']}/{daily_cap} today)")
+                else:
+                    log(f"  ✗ local add failed: {r.get('detail','')[:80]}")
+                    remaining_local.append(item)
+            except (HTTPError, URLError) as e:
+                log(f"  ✗ local add error: {e}")
+                remaining_local.append(item)
 
-        if not (magnet.startswith("magnet:?") or magnet.startswith("http")):
-            log(f"  ⚠ dropping queue item with unrecognised scheme: {str(item)[:80]}")
-            continue
+        if len(remaining_local) != len(local_queue):
+            save_queue(remaining_local)
+            removed = len(local_queue) - len(remaining_local)
+            log(f"  🗂  queue.jsonl: removed {removed} item(s), "
+                f"{len(remaining_local)} remaining")
+    elif not local_queue:
+        log(f"  📭 local queue.jsonl is empty")
 
-        # Dedup: skip if hash already known to TorBox
-        item_hash = _extract_hash(magnet)
-        if item_hash and item_hash in live_hashes:
-            log(f"  ⏭  skipping queue item (already in TorBox): {item.get('name', item_hash[:12])}")
-            # Remove from queue — it's already there, no point keeping it
-            continue
-
-        try:
-            r = add_torrent(magnet)
-            if r.get("success"):
-                data = r.get("data")
-                tid = data.get("torrent_id") if isinstance(data, dict) else None
-                if tid is None and isinstance(data, int):
-                    tid = data
-                if tid is None:
-                    log(f"  ⚠ add succeeded but no torrent_id in response: {r}")
-                    failed.append(item)
-                    remaining_queue.append(item)
-                    continue
-                state.setdefault("fresh_ids", {})[str(tid)] = (
-                    datetime.now(timezone.utc).isoformat()
-                )
-                state["queue_consumed_today"] += 1
-                added.append(item)
-                log(f"  ✓ added id={tid} '{item.get('name', magnet[:40])}' from queue "
-                    f"({state['queue_consumed_today']}/{daily_cap} today, "
-                    f"{len(added)}/{max_adds} this run)")
-                # Successfully added — do NOT put back in queue
-            else:
-                detail = r.get("detail") or str(r)
-                log(f"  ✗ queue add failed: {detail}")
-                failed.append(item)
-                remaining_queue.append(item)  # keep for retry next run
-        except (HTTPError, URLError) as e:
-            log(f"  ✗ queue add error: {e}")
-            failed.append(item)
-            remaining_queue.append(item)
-
-    # Persist the trimmed queue (added items removed, failed/uncapped items kept)
-    if len(remaining_queue) != len(queue):
-        save_queue(remaining_queue)
-        removed = len(queue) - len(remaining_queue)
-        log(f"  🗂  queue.jsonl updated: removed {removed} item(s), {len(remaining_queue)} remaining")
-
-    return added, failed
+    return added, []
 
 
 # ---------------------------------------------------------------------------
@@ -987,8 +1043,8 @@ def main():
     slots_free = max(0, MAX_ACTIVE_SLOTS - slots_used)
 
     if slots_free > 0 and cfg.get("queue_enabled", True) and not cfg["dry_run"]:
-        log(f"📥 {slots_free} free slot(s) — attempting queue fill...")
-        added, _ = add_from_queue(slots_free, state, cfg, live_torrents=torrents)
+        log(f"📥 {slots_free} free slot(s) — filling from TorBox queue then local queue...")
+        added, _ = fill_slots(slots_free, state, cfg, live_torrents=torrents)
         if added:
             try:
                 new_torrents = list_torrents()
