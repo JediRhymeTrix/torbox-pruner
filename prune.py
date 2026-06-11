@@ -79,6 +79,9 @@ DEFAULT_CONFIG = {
     # Queue auto-fill
     "queue_enabled": True,
     "queue_daily_add_cap": 50,
+    # Fill priority: "local" = queue.jsonl first, then TorBox queue (default)
+    #                "torbox" = TorBox internal queue first, then queue.jsonl
+    "queue_priority": "local",
 
     # Safety
     "max_deletes_per_run": 10,
@@ -834,19 +837,16 @@ def _extract_hash(magnet):
 
 def fill_slots(slots_free, state, cfg, live_torrents=None):
     """
-    Fill free slots using two sources in priority order:
+    Fill free slots from two sources. Order controlled by cfg["queue_priority"]:
 
-    1. TorBox's own internal queue (GET /v1/api/queued/getqueued)
-       Items here are waiting for a slot. We promote them via
-       POST /v1/api/queued/controlqueued {operation: "start"}.
-       These are the user's real backlog — always consumed first.
+      "local"  (default) — queue.jsonl first, then TorBox internal queue.
+                           Manually-added items jump ahead of the backlog.
+      "torbox"           — TorBox internal queue first, then queue.jsonl.
+                           Drains existing TorBox backlog before adding new items.
 
-    2. Local queue.jsonl (magnet links added manually via add-to-queue.sh)
-       Only used to top up any slots still free after the TorBox queue
-       is exhausted or empty. Added via createtorrent as new items.
-       Deduped by infohash against live TorBox inventory (active + queued).
-
-    Both sources respect the daily cap (queue_daily_add_cap).
+    TorBox internal queue: promoted via POST /v1/api/queued/controlqueued {start}.
+    Local queue.jsonl:     added via createtorrent, deduped by infohash.
+    Both sources share the daily cap (queue_daily_add_cap).
     """
     if not cfg.get("queue_enabled", True) or slots_free <= 0:
         return [], []
@@ -862,56 +862,62 @@ def fill_slots(slots_free, state, cfg, live_torrents=None):
 
     added = []
     remaining_slots = slots_free
+    priority = cfg.get("queue_priority", "local")  # "local" | "torbox"
 
-    # ── Source 1: TorBox internal queue ──────────────────────────────────────
+    # Fetch both sources up-front (needed for dedup regardless of order)
     torbox_queue = list_torbox_queue()
-    if torbox_queue:
-        log(f"  📋 TorBox queue: {len(torbox_queue)} item(s) waiting for a slot")
+    local_queue  = load_queue()
+
+    # Build live hash set for dedup (active list + TorBox internal queue)
+    live_hashes = set()
+    for t in (live_torrents or []):
+        h = (t.get("hash") or "").lower()
+        if h:
+            live_hashes.add(h)
+        for alt in (t.get("alternative_hashes") or []):
+            live_hashes.add(alt.lower())
+    for t in torbox_queue:
+        h = (t.get("hash") or "").lower()
+        if h:
+            live_hashes.add(h)
+
+    # ── Inner: promote items from TorBox's internal queue ────────────────────
+    def _fill_torbox():
+        nonlocal remaining_slots
+        if not torbox_queue:
+            log(f"  📭 TorBox internal queue is empty")
+            return
+        log(f"  📋 TorBox internal queue: {len(torbox_queue)} item(s) waiting")
         for item in torbox_queue:
             if remaining_slots <= 0 or state["queue_consumed_today"] >= daily_cap:
                 break
             qid  = item.get("id")
-            name = item.get("name") or item.get("hash", "?")[:16]
+            name = (item.get("name") or item.get("hash", "?"))[:60]
             try:
                 r = control_queued_torrent(qid, "start")
                 if r.get("success"):
                     state["queue_consumed_today"] += 1
                     remaining_slots -= 1
                     added.append({"source": "torbox_queue", "queued_id": qid, "name": name})
-                    log(f"  ✓ started queued id={qid} '{name[:60]}' "
+                    log(f"  ✓ started torbox queued id={qid} '{name}' "
                         f"({state['queue_consumed_today']}/{daily_cap} today)")
                 else:
                     log(f"  ✗ start queued id={qid} failed: {r.get('detail','')[:80]}")
             except (HTTPError, URLError) as e:
                 log(f"  ✗ start queued id={qid} error: {e}")
-    else:
-        log(f"  📭 TorBox queue is empty")
 
-    # ── Source 2: local queue.jsonl top-up ────────────────────────────────────
-    local_queue = load_queue()
-    if local_queue and remaining_slots > 0:
-        log(f"  📂 local queue.jsonl: {len(local_queue)} item(s), "
-            f"{remaining_slots} slot(s) still free")
-
-        # Build live hash set for dedup (active + TorBox queued)
-        live_hashes = set()
-        for t in (live_torrents or []):
-            h = (t.get("hash") or "").lower()
-            if h:
-                live_hashes.add(h)
-            for alt in (t.get("alternative_hashes") or []):
-                live_hashes.add(alt.lower())
-        for t in torbox_queue:
-            h = (t.get("hash") or "").lower()
-            if h:
-                live_hashes.add(h)
-
+    # ── Inner: add items from local queue.jsonl ───────────────────────────────
+    def _fill_local():
+        nonlocal remaining_slots
+        if not local_queue:
+            log(f"  📭 local queue.jsonl is empty")
+            return
+        log(f"  📂 local queue.jsonl: {len(local_queue)} item(s)")
         remaining_local = []
         for item in local_queue:
             if remaining_slots <= 0 or state["queue_consumed_today"] >= daily_cap:
                 remaining_local.append(item)
                 continue
-
             magnet = item.get("magnet") or item.get("url") or item.get("link")
             if not magnet or not isinstance(magnet, str):
                 log(f"  ⚠ dropping invalid local queue item: {str(item)[:80]}")
@@ -919,13 +925,11 @@ def fill_slots(slots_free, state, cfg, live_torrents=None):
             if not (magnet.startswith("magnet:?") or magnet.startswith("http")):
                 log(f"  ⚠ dropping local queue item with unrecognised scheme: {str(item)[:80]}")
                 continue
-
             item_hash = _extract_hash(magnet)
             if item_hash and item_hash in live_hashes:
                 log(f"  ⏭  skipping local item (already in TorBox): "
                     f"{item.get('name', item_hash[:12])}")
-                continue  # remove from local queue — already present
-
+                continue  # drop from queue — already present
             try:
                 r = add_torrent(magnet)
                 if r.get("success"):
@@ -942,9 +946,9 @@ def fill_slots(slots_free, state, cfg, live_torrents=None):
                     )
                     state["queue_consumed_today"] += 1
                     remaining_slots -= 1
-                    added.append({"source": "local_queue", "torrent_id": tid,
-                                  "name": item.get("name", magnet[:40])})
-                    log(f"  ✓ added local id={tid} '{item.get('name', magnet[:40])}' "
+                    name = item.get("name", magnet[:40])
+                    added.append({"source": "local_queue", "torrent_id": tid, "name": name})
+                    log(f"  ✓ added local id={tid} '{name}' "
                         f"({state['queue_consumed_today']}/{daily_cap} today)")
                 else:
                     log(f"  ✗ local add failed: {r.get('detail','')[:80]}")
@@ -952,14 +956,23 @@ def fill_slots(slots_free, state, cfg, live_torrents=None):
             except (HTTPError, URLError) as e:
                 log(f"  ✗ local add error: {e}")
                 remaining_local.append(item)
-
         if len(remaining_local) != len(local_queue):
             save_queue(remaining_local)
             removed = len(local_queue) - len(remaining_local)
             log(f"  🗂  queue.jsonl: removed {removed} item(s), "
                 f"{len(remaining_local)} remaining")
-    elif not local_queue:
-        log(f"  📭 local queue.jsonl is empty")
+
+    # ── Dispatch in configured priority order ─────────────────────────────────
+    if priority == "torbox":
+        log(f"  🔀 fill priority: TorBox queue → local queue")
+        _fill_torbox()
+        if remaining_slots > 0:
+            _fill_local()
+    else:
+        log(f"  🔀 fill priority: local queue → TorBox queue")
+        _fill_local()
+        if remaining_slots > 0:
+            _fill_torbox()
 
     return added, []
 

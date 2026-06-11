@@ -10,6 +10,7 @@
 
   "queue_enabled": true,
   "queue_daily_add_cap": 50,
+  "queue_priority": "local",
 
   "max_deletes_per_run": 10,
 
