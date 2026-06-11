@@ -835,6 +835,14 @@ def _extract_hash(magnet):
     return m.group(1).lower() if m else None
 
 
+def _extract_dn(magnet):
+    """Return decoded display name (dn=) from a magnet URI, or None."""
+    import re
+    from urllib.parse import unquote_plus
+    m = re.search(r'[?&]dn=([^&]+)', magnet or "")
+    return unquote_plus(m.group(1)) if m else None
+
+
 def fill_slots(slots_free, state, cfg, live_torrents=None):
     """
     Fill free slots from two sources. Order controlled by cfg["queue_priority"]:
@@ -891,14 +899,24 @@ def fill_slots(slots_free, state, cfg, live_torrents=None):
         for item in torbox_queue:
             if remaining_slots <= 0 or state["queue_consumed_today"] >= daily_cap:
                 break
-            qid  = item.get("id")
-            name = (item.get("name") or item.get("hash", "?"))[:60]
+            qid    = item.get("id")
+            # TorBox returns "Unknown Torrent Name" for most queued items —
+            # try to get a real name from the magnet's dn= parameter instead.
+            raw_name = item.get("name") or ""
+            dn_name  = _extract_dn(item.get("magnet") or "")
+            if dn_name:
+                name = dn_name[:60]
+            elif raw_name and raw_name.lower() != "unknown torrent name":
+                name = raw_name[:60]
+            else:
+                name = (item.get("hash") or "?")[:16]  # fall back to hash prefix
             try:
                 r = control_queued_torrent(qid, "start")
                 if r.get("success"):
                     state["queue_consumed_today"] += 1
                     remaining_slots -= 1
-                    added.append({"source": "torbox_queue", "queued_id": qid, "name": name})
+                    added.append({"source": "torbox_queue", "queued_id": qid,
+                                  "name": name, "hash": (item.get("hash") or "").lower()})
                     log(f"  ✓ started torbox queued id={qid} '{name}' "
                         f"({state['queue_consumed_today']}/{daily_cap} today)")
                 else:
@@ -947,7 +965,8 @@ def fill_slots(slots_free, state, cfg, live_torrents=None):
                     state["queue_consumed_today"] += 1
                     remaining_slots -= 1
                     name = item.get("name", magnet[:40])
-                    added.append({"source": "local_queue", "torrent_id": tid, "name": name})
+                    added.append({"source": "local_queue", "torrent_id": tid, "name": name,
+                                  "hash": (item_hash or "")})
                     log(f"  ✓ added local id={tid} '{name}' "
                         f"({state['queue_consumed_today']}/{daily_cap} today)")
                 else:
@@ -1059,6 +1078,7 @@ def main():
         log(f"📥 {slots_free} free slot(s) — filling from TorBox queue then local queue...")
         added, _ = fill_slots(slots_free, state, cfg, live_torrents=torrents)
         if added:
+            new_torrents = []
             try:
                 new_torrents = list_torrents()
                 buckets = classify(new_torrents, state, cfg)
@@ -1066,10 +1086,30 @@ def main():
             except Exception as e:
                 log(f"⚠️  re-classify after queue fill failed: {e}", "warn")
             if cfg.get("notify_on_deletion") and not args.no_notify:
-                body = "Added " + ", ".join(
-                    (it.get("name") or (it.get("magnet") or "")[:40])
-                    for it in added[:5]
-                ) + f" from queue ({len(added)} item(s))"
+                # Build a hash→name lookup from the freshly-fetched torrent list
+                # so we can substitute real names for anything that was just started.
+                hash_to_name = {
+                    (t.get("hash") or "").lower(): t.get("name") or ""
+                    for t in new_torrents
+                    if t.get("name") and t.get("name") != "Unknown Torrent Name"
+                }
+                def _resolve_name(it):
+                    # 1. Try fresh name from just-fetched active list (by hash)
+                    h = (it.get("hash") or "").lower()
+                    if h and hash_to_name.get(h):
+                        return hash_to_name[h]
+                    # 2. Use the name we stored at start time (may be dn= or hash prefix)
+                    n = it.get("name") or ""
+                    if n and n.lower() != "unknown torrent name":
+                        return n
+                    # 3. Hash prefix as last resort
+                    return h[:16] if h else "?"
+
+                names = [_resolve_name(it) for it in added[:5]]
+                names_str = "\n".join(f"• {n}" for n in names)
+                if len(added) > 5:
+                    names_str += f"\n…and {len(added) - 5} more"
+                body = f"Started {len(added)} item(s) from queue:\n{names_str}"
                 notify("📥 TorBox: Queue Filled", body, urgent=False)
     elif slots_free <= 0:
         log("  no free slots, skipping queue fill")
