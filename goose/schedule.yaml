@@ -1,0 +1,6 @@
+version: 1.0
+schedules:
+  - id: torbox-pruner
+    recipe_source: torbox-pruner
+    cron: "*/10 * * * *"
+    enabled: true

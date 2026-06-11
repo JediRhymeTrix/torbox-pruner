@@ -1,0 +1,25 @@
+# Runtime state — machine-specific, never commit
+state.json
+notifications.jsonl
+queue.jsonl
+
+# Secrets
+.env
+
+# Logs
+logs/
+
+# macOS
+.DS_Store
+
+# Stale backups created during development
+*.bak
+*.bak-*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# User config (derived from config.example.json by install.sh)
+config.json

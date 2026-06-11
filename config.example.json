@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy this file to config.json and adjust as needed. All keys are optional — omitted keys fall back to the defaults shown here.",
+
+  "dead_stalled_no_seeds_min": 30,
+  "dead_stalled_no_internet_min": 10,
+  "dead_meta_min": 15,
+  "dead_checking_min": 10,
+
+  "fresh_grace_min": 15,
+
+  "queue_enabled": true,
+  "queue_daily_add_cap": 50,
+
+  "max_deletes_per_run": 10,
+
+  "notify_on_deletion": true,
+  "notify_healthy_full": true,
+  "notify_cooldown_min": 60,
+
+  "dry_run": false
+}
