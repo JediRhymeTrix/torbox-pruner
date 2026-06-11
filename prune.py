@@ -31,6 +31,17 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
+
+# Auto-load .env from the project directory so the script works when called
+# directly (python3 prune.py) as well as via run-prune.sh.
+_env_path = HERE / ".env"
+if _env_path.exists():
+    with _env_path.open() as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
 STATE_PATH = HERE / "state.json"
 LOGS_DIR = HERE / "logs"
 QUEUE_PATH = HERE / "queue.jsonl"

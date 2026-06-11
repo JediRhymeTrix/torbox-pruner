@@ -24,6 +24,16 @@ from urllib.error import HTTPError, URLError
 HERE = Path(__file__).resolve().parent
 NOTIFICATIONS_PATH = HERE / "notifications.jsonl"
 
+# Auto-load .env so notify.py works when called directly
+_env_path = HERE / ".env"
+if _env_path.exists():
+    with _env_path.open() as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 TELEGRAM_API = "https://api.telegram.org"
 
 # ---------------------------------------------------------------------------
