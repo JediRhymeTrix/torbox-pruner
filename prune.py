@@ -1006,6 +1006,21 @@ def main():
     ap.add_argument("--no-notify", action="store_true", help="skip notifications")
     args = ap.parse_args()
 
+    # ── Lockfile: exit immediately if another instance is already running ─────
+    # The Goose scheduler fires multiple concurrent recipe sessions when a
+    # previous session times out without completing. This ensures only one
+    # instance runs at a time; subsequent ones exit cleanly (code 0).
+    import fcntl
+    LOCK_PATH = HERE / ".prune.lock"
+    lock_fh = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("⏩ Another instance is already running — exiting.")
+        lock_fh.close()
+        return 0
+    # Lock held for the lifetime of this process; released on exit automatically
+
     cfg = load_config()
     if not API_KEY:
         log("❌ TORBOX_API_KEY env var not set. See .env.example.", "error")

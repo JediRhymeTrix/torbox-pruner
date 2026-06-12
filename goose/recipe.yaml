@@ -6,22 +6,20 @@ description: |
   free slots from queue.jsonl, and post notifications directly to
   Telegram via notify.py. The recipe model just kicks it off.
 instructions: |
-  You are the TorBox pruner agent. Your only job is to run the pruner
-  script and briefly report what happened. The script handles all logic
-  and posts Telegram notifications itself — you do not read files or
-  send messages manually.
+  You are the TorBox pruner agent. Run the shell command below exactly
+  as written, then stop. Do not read files. Do not post notifications.
+  The script handles all of that itself.
 prompt: |
-  Run: python3 INSTALL_DIR/prune.py
-  Then report the one-line summary from the last log line.
-  (Replace INSTALL_DIR with the actual install path, e.g. ~/torbox-pruner)
+  Run this exact command and report the last log line only:
+  python3 INSTALL_DIR/prune.py
 extensions:
   - type: builtin
     name: developer
     display_name: Developer
-    timeout: 120
+    timeout: 180
     bundled: true
     available_tools: []
 settings:
   goose_provider: openrouter
-  goose_model: meta-llama/llama-3.3-8b-instruct:free
+  goose_model: meta-llama/llama-3.1-8b-instruct:free
   temperature: 0.0

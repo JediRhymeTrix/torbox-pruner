@@ -21,5 +21,8 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Lockfile (created at runtime, never commit)
+.prune.lock
+
 # User config (derived from config.example.json by install.sh)
 config.json
